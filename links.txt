@@ -1,0 +1,11 @@
+
+
+TWS API DOCS
+
+https://ibkrcampus.com/campus/ibkr-api-page/twsapi-doc/#api-introduction
+
+
+ib_async python api docs
+
+https://ib-api-reloaded.github.io/ib_async/api.html#ib_async.contract.Contract
+
