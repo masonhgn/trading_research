@@ -2,3 +2,6 @@ ib_async
 matplotlib
 numpy
 statsmodels
+pandas
+pytz
+tqdm
