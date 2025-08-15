@@ -5,3 +5,4 @@ statsmodels
 pandas
 pytz
 tqdm
+aiohttp

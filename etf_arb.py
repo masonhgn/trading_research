@@ -86,7 +86,7 @@ async def fetch_stock_minute_bars(
     currency: str = "USD",
     end_datetime: dt.datetime = None,
     duration: str = "1 D",
-    bar_size: str = "1 min",
+    bar_size: str = "10 secs",
     what_to_show: str = "TRADES",
     use_rth: bool = True,
     format_date: int = 1
@@ -244,7 +244,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from statsmodels.tsa.stattools import coint, adfuller
-from tools import fetch_stock_minute_bars
+# from tools import fetch_stock_minute_bars  # Commented out since we have the function in this file
 
 
 class ZScoreStatArbStrategy:
@@ -493,8 +493,9 @@ import asyncio
 
 async def main():
     ib = IB()
-    await ib.connectAsync("127.0.0.1", 4001, clientId=11)
+    await ib.connectAsync("127.0.0.1", 4002, clientId=11)
     util.startLoop()
+    
 
     # Run strategy with optimized parameters
     strat = ZScoreStatArbStrategy(
@@ -508,7 +509,7 @@ async def main():
         filter_trading_hours=True, 
         auto_detect_hours=False  # Use fixed trading hours for US markets
     )
-    df, stats = await strat.backtest(duration="3 D", end_datetime=dt.datetime(2025, 8, 5, 16))
+    df, stats = await strat.backtest(duration="1 D", end_datetime=dt.datetime(2025, 8, 14, 16))
     
     strat.plot_spread(df)
     strat.plot_pnl(df)
