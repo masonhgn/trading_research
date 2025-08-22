@@ -49,6 +49,24 @@ class PnLNotification:
     drawdown: float
     drawdown_pct: float
 
+@dataclass
+class DataCollectionNotification:
+    """Data structure for data collection status notifications"""
+    timestamp: datetime
+    symbol1: str
+    symbol2: str
+    data_points_sym1: int
+    data_points_sym2: int
+    window_size: int
+    has_sufficient_data: bool
+    current_spread: Optional[float] = None
+    rolling_mean: Optional[float] = None
+    rolling_std: Optional[float] = None
+    current_zscore: Optional[float] = None
+    entry_threshold: Optional[float] = None
+    exit_threshold: Optional[float] = None
+    trading_day: Optional[str] = None
+
 class TelegramNotifier:
     """
     Standalone Telegram notification system for trading updates.
@@ -193,6 +211,29 @@ class TelegramNotifier:
         
         return await self.send_message(full_message)
     
+    async def send_data_collection_notification(self, data: DataCollectionNotification) -> bool:
+        """
+        Send a data collection status notification to Telegram.
+        
+        Args:
+            data: DataCollectionNotification object with data collection details
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        # Format the data collection message
+        message = self._format_data_collection_message(data)
+        
+        # Add emoji based on data status
+        if data.has_sufficient_data:
+            emoji = "📊"
+        else:
+            emoji = "📈"
+        
+        full_message = f"{emoji} <b>DATA COLLECTION STATUS</b>\n\n{message}"
+        
+        return await self.send_message(full_message)
+    
     def _format_trade_message(self, trade: TradeNotification) -> str:
         """Format trade notification message"""
         timestamp = trade.timestamp.strftime("%Y-%m-%d %H:%M:%S")
@@ -255,6 +296,60 @@ class TelegramNotifier:
 • Peak Portfolio: {peak_str}
 • Current Drawdown: {drawdown_str} ({drawdown_pct_str})
 """
+        
+        return message
+    
+    def _format_data_collection_message(self, data: DataCollectionNotification) -> str:
+        """Format data collection notification message"""
+        timestamp = data.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Format data collection status
+        status_emoji = "✅" if data.has_sufficient_data else "⏳"
+        status_text = "READY FOR TRADING" if data.has_sufficient_data else "COLLECTING DATA"
+        
+        message = f"""
+<b>Time:</b> {timestamp}
+<b>Status:</b> {status_emoji} {status_text}
+<b>Trading Day:</b> {data.trading_day or 'Unknown'}
+
+<b>Data Points:</b>
+• {data.symbol1}: {data.data_points_sym1}/{data.window_size}
+• {data.symbol2}: {data.data_points_sym2}/{data.window_size}
+
+<b>Window Size:</b> {data.window_size} data points
+"""
+        
+        # Add spread information if available
+        if data.current_spread is not None:
+            spread_str = f"${data.current_spread:.4f}"
+            message += f"\n<b>Current Spread ({data.symbol1} - {data.symbol2}):</b> {spread_str}"
+            
+            if data.rolling_mean is not None and data.rolling_std is not None:
+                mean_str = f"${data.rolling_mean:.4f}"
+                std_str = f"${data.rolling_std:.4f}"
+                message += f"\n<b>Rolling Mean:</b> {mean_str}"
+                message += f"\n<b>Rolling Std Dev:</b> {std_str}"
+                
+                if data.current_zscore is not None:
+                    zscore_str = f"{data.current_zscore:.2f}"
+                    message += f"\n<b>Current Z-Score:</b> {zscore_str}"
+                    
+                    # Add threshold information
+                    if data.entry_threshold is not None and data.exit_threshold is not None:
+                        entry_str = f"{data.entry_threshold:.2f}"
+                        exit_str = f"{data.exit_threshold:.2f}"
+                        
+                        # Determine proximity to thresholds
+                        abs_zscore = abs(data.current_zscore)
+                        if abs_zscore >= data.entry_threshold:
+                            proximity = "🔴 ABOVE ENTRY THRESHOLD"
+                        elif abs_zscore >= data.exit_threshold:
+                            proximity = "🟡 BETWEEN THRESHOLDS"
+                        else:
+                            proximity = "🟢 BELOW EXIT THRESHOLD"
+                        
+                        message += f"\n<b>Thresholds:</b> Entry: ±{entry_str}, Exit: ±{exit_str}"
+                        message += f"\n<b>Status:</b> {proximity}"
         
         return message
 
@@ -348,6 +443,49 @@ async def send_system_alert(title: str, message: str, level: str = "INFO") -> bo
     async with TelegramNotifier() as notifier:
         return await notifier.send_system_notification(title, message, level)
 
+async def send_data_collection_update(
+    symbol1: str,
+    symbol2: str,
+    data_points_sym1: int,
+    data_points_sym2: int,
+    window_size: int,
+    has_sufficient_data: bool,
+    current_spread: Optional[float] = None,
+    rolling_mean: Optional[float] = None,
+    rolling_std: Optional[float] = None,
+    current_zscore: Optional[float] = None,
+    entry_threshold: Optional[float] = None,
+    exit_threshold: Optional[float] = None,
+    trading_day: Optional[str] = None
+) -> bool:
+    """
+    Standalone function to send data collection status notifications.
+    
+    Args:
+        All data collection parameters
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    async with TelegramNotifier() as notifier:
+        data = DataCollectionNotification(
+            timestamp=datetime.now(),
+            symbol1=symbol1,
+            symbol2=symbol2,
+            data_points_sym1=data_points_sym1,
+            data_points_sym2=data_points_sym2,
+            window_size=window_size,
+            has_sufficient_data=has_sufficient_data,
+            current_spread=current_spread,
+            rolling_mean=rolling_mean,
+            rolling_std=rolling_std,
+            current_zscore=current_zscore,
+            entry_threshold=entry_threshold,
+            exit_threshold=exit_threshold,
+            trading_day=trading_day
+        )
+        return await notifier.send_data_collection_notification(data)
+
 # Test function
 async def test_telegram_notifications():
     """Test all notification types"""
@@ -395,6 +533,27 @@ async def test_telegram_notifications():
         level="INFO"
     )
     print(f"System notification: {'✅' if success else '❌'}")
+    
+    await asyncio.sleep(2)
+    
+    # Test data collection notification
+    print("Sending data collection notification...")
+    success = await send_data_collection_update(
+        symbol1="SPY",
+        symbol2="VOO",
+        data_points_sym1=45,
+        data_points_sym2=45,
+        window_size=90,
+        has_sufficient_data=False,
+        current_spread=51.96,
+        rolling_mean=52.15,
+        rolling_std=0.85,
+        current_zscore=-0.22,
+        entry_threshold=1.5,
+        exit_threshold=0.2,
+        trading_day="2025-08-15"
+    )
+    print(f"Data collection notification: {'✅' if success else '❌'}")
 
 if __name__ == "__main__":
     # Run test

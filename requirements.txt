@@ -6,3 +6,10 @@ pandas
 pytz
 tqdm
 aiohttp
+PyYAML
+Flask
+Flask-Login
+Flask-SocketIO
+Werkzeug
+eventlet
+pytest

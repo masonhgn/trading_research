@@ -1,0 +1,29 @@
+{
+  "admin": {
+    "user_id": "admin",
+    "username": "admin",
+    "email": "admin@trading.com",
+    "password_hash": "scrypt:32768:8:1$6Wd3QycIF0AuFBf3$9dfd1654b71cc30d6f5da2944e68308c6a5a3b86f9d9cfd29c26dcb5a0fc209a4f30775274cb19ab27311545f5b45b790cebbf9d56bc48cf5be2e1eaa5d91bc5",
+    "role": "admin",
+    "is_active": true,
+    "created_at": "2025-08-15T04:22:55.742068"
+  },
+  "trader": {
+    "user_id": "trader",
+    "username": "trader",
+    "email": "trader@trading.com",
+    "password_hash": "scrypt:32768:8:1$BBGCOZKtywZLGEIL$ae2e161f893175d9f7a251487bc066a8ee083ce6dfcfc3b54efe3a65a7e3789b1a072ef98ace8f9288e2e727c8dac9db5f96844c055b7b9a47af58599ea0188b",
+    "role": "trader",
+    "is_active": true,
+    "created_at": "2025-08-15T04:22:55.831194"
+  },
+  "viewer": {
+    "user_id": "viewer",
+    "username": "viewer",
+    "email": "viewer@trading.com",
+    "password_hash": "scrypt:32768:8:1$Fc8PEq3tGjab3GBH$1582b73501668489ba80b648ed1cb20b414342305939426e2d009db5b183c4be7691e102d2b4884c7d88d0d09ead5ba1d5f4a9de218874e7608e57a85e1dce53",
+    "role": "viewer",
+    "is_active": true,
+    "created_at": "2025-08-15T04:22:55.919615"
+  }
+}

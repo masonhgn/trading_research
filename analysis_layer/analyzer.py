@@ -3,6 +3,7 @@ import numpy as np
 from typing import Dict, Tuple, Optional
 import matplotlib.pyplot as plt
 from scipy import stats
+from infrastructure.config import config
 
 
 class BacktestAnalyzer:
@@ -106,7 +107,7 @@ class BacktestAnalyzer:
         
         return df
     
-    def calculate_rolling_metrics(self, df: pd.DataFrame, window: int = 60) -> pd.DataFrame:
+    def calculate_rolling_metrics(self, df: pd.DataFrame, window: int = None) -> pd.DataFrame:
         """
         Calculate rolling return and volatility metrics (no risk-free rate required).
         
@@ -117,6 +118,9 @@ class BacktestAnalyzer:
         Returns:
             DataFrame with rolling metrics
         """
+        if window is None:
+            window = config.ANALYSIS_CONFIG['rolling_window']
+        
         df = df.copy()
         
         # Rolling return (annualized)
@@ -188,7 +192,9 @@ class BacktestAnalyzer:
         max_drawdown_pct = df['drawdown_pct'].min()
         
         # Value at Risk (95% confidence)
-        var_95 = np.percentile(df['pct_return'].dropna(), 5)
+        var_confidence = config.ANALYSIS_CONFIG['var_confidence']
+        var_percentile = (1 - var_confidence) * 100
+        var_95 = np.percentile(df['pct_return'].dropna(), var_percentile)
         
         # Conditional Value at Risk (Expected Shortfall)
         cvar_95 = df['pct_return'][df['pct_return'] <= var_95].mean()
@@ -375,7 +381,7 @@ class BacktestAnalyzer:
             df: DataFrame with analysis results
             analysis_summary: Dictionary with analysis summary
         """
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig, axes = plt.subplots(2, 2, figsize=config.ANALYSIS_CONFIG['plot_figsize'])
         fig.suptitle('Backtest Performance Analysis', fontsize=16, fontweight='bold')
         
         # Plot 1: Portfolio Value and Drawdown

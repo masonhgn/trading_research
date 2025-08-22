@@ -12,8 +12,8 @@ from enum import Enum
 from ib_async import IB, util
 from ib_async.contract import Stock
 from ib_async.order import MarketOrder, StopOrder
-from etf_arb import ZScoreStatArbStrategy
-from telegram_notifier import send_trade_update, send_pnl_update, send_system_alert
+from strategy_layer.etf_arbitrage import ETFArbitrageStrategy
+from infrastructure.notifications import send_trade_update, send_pnl_update, send_system_alert, send_data_collection_update
 
 LIVE_PORT = 4001
 PAPER_PORT = 4002
@@ -265,7 +265,7 @@ async def get_account_status(ib: IB) -> Dict[str, any]:
         return {'connected': False, 'health': 'error', 'error': str(e)}
 
 
-async def get_intraday_historical_data(ib: IB, symbol: str, duration: str = "1 D", bar_size: str = "1 min") -> List[Dict]:
+async def get_intraday_historical_data(ib: IB, symbol: str, duration: str = "1 D", bar_size: str = "10 secs") -> List[Dict]:
     """
     Get intraday historical data for a symbol.
     Useful for initial data collection at market open.
@@ -459,7 +459,7 @@ class TradingConfig:
     # IB connection
     ib_host: str = "127.0.0.1"
     ib_port: int = PAPER_PORT  # Default to paper trading port
-    ib_client_id: int = 42
+    ib_client_id: int = 11  # Trading instance clientId
     paper_trading: bool = True  # True for paper, False for live
     
     # Dynamic values (will be populated from API)
@@ -566,6 +566,12 @@ class LiveTrader:
         self.last_request_time = 0
         self.min_request_interval = 2.0  # Minimum 2 seconds between requests
         
+        # Notification control
+        self.trade_occurred = False
+        
+        # Data initialization tracking
+        self.data_initialized_for_day = None
+        
         # Setup logging
         self.setup_logging()
         
@@ -577,16 +583,16 @@ class LiveTrader:
         # Main trading log
         mode = "paper" if self.config.paper_trading else "live"
         self.logger = logging.getLogger(f'{mode.capitalize()}Trader')
-        self.logger.setLevel(logging.DEBUG)  # Enable debug logging
+        self.logger.setLevel(logging.INFO)  # Only INFO and above for console
         
-        # File handler
+        # File handler (keep debug for file)
         today = dt.datetime.now().strftime('%Y-%m-%d')
         fh = logging.FileHandler(f'{log_dir}/{mode}_trading_{today}.log')
-        fh.setLevel(logging.DEBUG)  # Enable debug logging
+        fh.setLevel(logging.DEBUG)  # Keep debug logging in file
         
-        # Console handler
+        # Console handler (clean output)
         ch = logging.StreamHandler()
-        ch.setLevel(logging.DEBUG)  # Enable debug logging
+        ch.setLevel(logging.INFO)  # Only INFO and above for console
         
         # Formatter
         formatter = logging.Formatter(
@@ -629,7 +635,15 @@ class LiveTrader:
     def is_market_open(self) -> bool:
         """Check if market is currently open."""
         now = dt.datetime.now()
-        et_time = now.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        
+        # Convert to Eastern Time properly
+        try:
+            import pytz
+            et_tz = pytz.timezone('US/Eastern')
+            et_time = now.astimezone(et_tz)
+        except ImportError:
+            # Fallback if pytz is not available - assume local time is ET
+            et_time = now
         
         # Simple market hours check (ET)
         market_open = dt.datetime.strptime(self.config.market_open, "%H:%M").time()
@@ -638,6 +652,8 @@ class LiveTrader:
         
         # Check if it's a weekday
         is_weekday = et_time.weekday() < 5
+        
+        # Debug logging removed for cleaner output
         
         return is_weekday and market_open <= current_time <= market_close
     
@@ -656,6 +672,10 @@ class LiveTrader:
             self.daily_trades = 0
             self.daily_start_value = self.portfolio_value
             self.trades_today = []
+            # Note: Data will be re-initialized in the trading loop when market opens
+        else:
+            # Same trading day - preserve existing data
+            self.logger.debug(f"Same trading day: {today} - preserving existing data")
     
     def validate_same_day_data(self) -> bool:
         """Validate that all data points are from the current trading day."""
@@ -680,9 +700,29 @@ class LiveTrader:
         
         return True
     
+    def validate_data_time_period(self, start_time: dt.datetime) -> bool:
+        """Validate that all data points are from the correct time period."""
+        for symbol in [self.config.sym1, self.config.sym2]:
+            for data_point in self.price_data[symbol]:
+                try:
+                    # Handle both timezone-aware and naive datetime objects
+                    dt_obj = data_point['datetime']
+                    if dt_obj.tzinfo is not None:
+                        # Convert to local time if timezone-aware
+                        dt_obj = dt_obj.astimezone().replace(tzinfo=None)
+                    
+                    if dt_obj < start_time:
+                        self.logger.error(f"Found data from before start time: {dt_obj} < {start_time} for {symbol}")
+                        return False
+                except Exception as e:
+                    self.logger.error(f"Error validating data point time: {e}")
+                    return False
+        
+        return True
+    
     def has_sufficient_data(self) -> bool:
         """Check if we have sufficient data points for the current trading day."""
-        min_data_points = max(self.config.window, 60)  # At least 60 data points or window size
+        min_data_points = self.config.window  # Need exactly window size for rolling calculations
         
         # Check if we have enough data for both symbols
         sym1_count = len(self.price_data[self.config.sym1])
@@ -690,53 +730,126 @@ class LiveTrader:
         
         has_enough = sym1_count >= min_data_points and sym2_count >= min_data_points
         
-        if not has_enough:
-            self.logger.info(f"Collecting same-day data: {sym1_count}/{min_data_points} {self.config.sym1}, "
-                           f"{sym2_count}/{min_data_points} {self.config.sym2} (Trading day: {self.current_trading_day})")
-        else:
-            self.logger.info(f"Sufficient same-day data available: {sym1_count} {self.config.sym1}, "
-                           f"{sym2_count} {self.config.sym2} (Trading day: {self.current_trading_day})")
+        # Only log status changes to avoid spam
+        if not hasattr(self, 'last_sufficient_data_status'):
+            self.last_sufficient_data_status = None
+        
+        current_status = has_enough
+        if current_status != self.last_sufficient_data_status:
+            if not has_enough:
+                self.logger.info(f"Collecting data: {sym1_count}/{min_data_points} {self.config.sym1}, {sym2_count}/{min_data_points} {self.config.sym2}")
+            else:
+                self.logger.info(f"✅ SUFFICIENT DATA: {sym1_count} {self.config.sym1}, {sym2_count} {self.config.sym2}")
+            self.last_sufficient_data_status = current_status
         
         return has_enough
     
+    def calculate_data_start_time(self) -> dt.datetime:
+        """Calculate the dynamic start time for data collection based on current time."""
+        now = dt.datetime.now()
+        today_start = dt.datetime.strptime(self.get_current_trading_day(), '%Y-%m-%d')
+        
+        # Calculate lookback period: window_size * frequency
+        # For 10-second frequency, each data point represents 10 seconds
+        # So window_size * 10 seconds = total lookback time
+        frequency_seconds = 10  # From config signal_frequency: "10 secs"
+        lookback_seconds = self.config.window * frequency_seconds
+        lookback_start = now - dt.timedelta(seconds=lookback_seconds)
+        
+        # Use the later of: lookback_start or today_start
+        data_start_time = max(lookback_start, today_start)
+        
+        # Ensure all datetime objects are timezone-naive for comparison
+        if data_start_time.tzinfo is not None:
+            data_start_time = data_start_time.replace(tzinfo=None)
+        
+        return data_start_time
+
     async def initialize_daily_data(self):
         """Initialize data collection with historical data from today."""
         try:
             self.logger.info("Initializing daily data collection...")
             
-            # Get historical data for both symbols (only today's data)
+            # Calculate the dynamic start time for data collection
+            data_start_time = self.calculate_data_start_time()
+            now = dt.datetime.now()
+            if now.tzinfo is not None:
+                now = now.replace(tzinfo=None)
+            
+            # Calculate lookback period for logging
+            frequency_seconds = 10  # From config signal_frequency: "10 secs"
+            lookback_seconds = self.config.window * frequency_seconds
+            today_start = dt.datetime.strptime(self.get_current_trading_day(), '%Y-%m-%d')
+            lookback_start = now - dt.timedelta(seconds=lookback_seconds)
+            
+            self.logger.info(f"Data collection start time: {data_start_time}")
+            self.logger.info(f"Lookback period: {lookback_seconds} seconds ({self.config.window} * {frequency_seconds}s)")
+            self.logger.info(f"Today start: {today_start}")
+            self.logger.info(f"Lookback start: {lookback_start}")
+            
+            # Get historical data for both symbols
             sym1_data = await get_intraday_historical_data(self.ib, self.config.sym1)
             sym2_data = await get_intraday_historical_data(self.ib, self.config.sym2)
             
+            self.logger.info(f"Retrieved {len(sym1_data)} historical bars for {self.config.sym1}, {len(sym2_data)} for {self.config.sym2}")
+            
             if sym1_data and sym2_data:
-                # Filter to ensure only today's data
-                today = self.get_current_trading_day()
+                # Filter data to start from the calculated start time
+                filtered_sym1_data = []
+                filtered_sym2_data = []
                 
-                # Add historical data to our storage (only today's data)
                 for data_point in sym1_data:
-                    data_date = data_point['datetime'].strftime('%Y-%m-%d')
-                    if data_date == today:  # Only add today's data
-                        self.price_data[self.config.sym1].append({
-                            'datetime': data_point['datetime'],
-                            'close': data_point['close']
-                        })
+                    # Handle timezone-aware datetime objects
+                    dt_obj = data_point['datetime']
+                    if dt_obj.tzinfo is not None:
+                        dt_obj = dt_obj.replace(tzinfo=None)
+                    
+                    if dt_obj >= data_start_time:
+                        filtered_sym1_data.append(data_point)
                 
                 for data_point in sym2_data:
-                    data_date = data_point['datetime'].strftime('%Y-%m-%d')
-                    if data_date == today:  # Only add today's data
-                        self.price_data[self.config.sym2].append({
-                            'datetime': data_point['datetime'],
-                            'close': data_point['close']
-                        })
+                    # Handle timezone-aware datetime objects
+                    dt_obj = data_point['datetime']
+                    if dt_obj.tzinfo is not None:
+                        dt_obj = dt_obj.replace(tzinfo=None)
+                    
+                    if dt_obj >= data_start_time:
+                        filtered_sym2_data.append(data_point)
+                
+                self.logger.info(f"Filtered to {len(filtered_sym1_data)} {self.config.sym1} bars, {len(filtered_sym2_data)} {self.config.sym2} bars")
+                
+                # Add filtered data to our storage
+                for data_point in filtered_sym1_data:
+                    # Ensure timezone-naive datetime
+                    dt_obj = data_point['datetime']
+                    if dt_obj.tzinfo is not None:
+                        dt_obj = dt_obj.replace(tzinfo=None)
+                    
+                    self.price_data[self.config.sym1].append({
+                        'datetime': dt_obj,
+                        'close': data_point['close']
+                    })
+                
+                for data_point in filtered_sym2_data:
+                    # Ensure timezone-naive datetime
+                    dt_obj = data_point['datetime']
+                    if dt_obj.tzinfo is not None:
+                        dt_obj = dt_obj.replace(tzinfo=None)
+                    
+                    self.price_data[self.config.sym2].append({
+                        'datetime': dt_obj,
+                        'close': data_point['close']
+                    })
+                
+                self.logger.info(f"After filtering: {len(filtered_sym1_data)} {self.config.sym1} bars, {len(filtered_sym2_data)} {self.config.sym2} bars")
                 
                 self.data_points_today = len(self.price_data[self.config.sym1])
-                self.logger.info(f"Initialized with {self.data_points_today} same-day historical data points for {self.config.sym1} and {self.config.sym2}")
+                self.logger.info(f"Initialized with {self.data_points_today} data points")
                 
-                # Validate that we only have today's data
-                if not self.validate_same_day_data():
-                    self.logger.error("Data validation failed - clearing data")
-                    self.price_data = {self.config.sym1: [], self.config.sym2: []}
-                    self.data_points_today = 0
+                # Validate that we have data from the correct time period
+                if not self.validate_data_time_period(data_start_time):
+                    self.logger.warning("Some data points are from before expected start time, but keeping data")
+                    # Don't clear data - just log the warning
             else:
                 self.logger.warning("Could not get historical data - will start with real-time collection")
                 
@@ -766,33 +879,53 @@ class LiveTrader:
                     return None
                 qualified_contracts[symbol] = qualified_contracts_list[0]
             
-            # Then request market data with proper delays
+            # Then request real-time data using real-time bars
             for symbol in [self.config.sym1, self.config.sym2]:
                 qualified_contract = qualified_contracts[symbol]
                 
-                # Request real-time data
-                self.logger.debug(f"Requesting market data for {symbol}...")
+                # Use market data for consistent pricing
                 ticker = self.ib.reqMktData(qualified_contract)
-                await asyncio.sleep(1.0)  # Longer wait for data
                 
-                # Log ticker details for debugging
-                self.logger.debug(f"Ticker for {symbol}: last={ticker.last}, bid={ticker.bid}, ask={ticker.ask}")
+                # Wait for data with timeout
+                timeout = 3.0
+                start_time = time.time()
                 
+                while (time.time() - start_time) < timeout:
+                    await asyncio.sleep(0.1)
+                    if ticker.last or ticker.close or ticker.marketPrice():
+                        break
+                
+                # Try different price fields in order of preference
+                price = None
                 if ticker.last and ticker.last > 0:
+                    price = ticker.last
+                    price_source = "last"
+                elif ticker.close and ticker.close > 0:
+                    price = ticker.close
+                    price_source = "close"
+                elif ticker.marketPrice() and ticker.marketPrice() > 0:
+                    price = ticker.marketPrice()
+                    price_source = "marketPrice"
+                elif ticker.bid and ticker.ask:
+                    price = (ticker.bid + ticker.ask) / 2
+                    price_source = "mid_price"
+                
+                if price and price > 0:
                     # Basic data quality check
-                    if ticker.last < 1.0 or ticker.last > 10000.0:
-                        self.logger.warning(f"Suspicious price for {symbol}: ${ticker.last}")
+                    if price < 1.0 or price > 10000.0:
+                        self.logger.warning(f"Suspicious price for {symbol}: ${price}")
                         return None
                     
-                    prices[symbol] = ticker.last
-                    self.logger.info(f"Got price for {symbol}: ${ticker.last}")
+                    prices[symbol] = price
+                    self.logger.info(f"Got price for {symbol}: ${price} (from {price_source})")
                 else:
-                    self.logger.warning(f"No valid price data for {symbol} - last={ticker.last}")
+                    self.logger.warning(f"No valid price data for {symbol}")
                     return None
                 
-                # Cancel market data subscription with delay
+                # Cancel market data subscription
                 self.ib.cancelMktData(qualified_contract)
-                await asyncio.sleep(0.5)  # Wait before next request
+                
+                await asyncio.sleep(0.3)  # Brief wait between requests
             
             self.last_request_time = time.time()  # Update last request time
             return prices
@@ -806,23 +939,35 @@ class LiveTrader:
         if not prices:
             return 0
             
-        # Calculate required capital for position
-        if self.current_position == 1:  # Long position
-            required_capital = prices[self.config.sym1] * self.config.shares_per_leg
+        # For new trades, use the configured shares per leg
+        # For existing positions, calculate based on current position
+        if self.current_position == 0:
+            # New trade - use configured shares per leg
+            shares = self.config.shares_per_leg
+        elif self.current_position == 1:  # Long position
+            shares = self.current_shares
         elif self.current_position == -1:  # Short position
-            required_capital = prices[self.config.sym2] * self.config.shares_per_leg
+            shares = self.current_shares
         else:
             return 0
         
         # Check risk limits
         max_capital = self.portfolio_value * self.config.risk_limits.max_position_size_pct
         
+        # Calculate required capital for the trade
+        if self.current_position == 0:
+            # For new trades, use the higher price to be conservative
+            required_capital = max(prices.values()) * shares
+        else:
+            # For existing positions, use current position value
+            required_capital = max(prices.values()) * shares
+        
         if required_capital > max_capital:
             shares = int(max_capital / max(prices.values()))
             self.logger.warning(f"Position size limited by risk: {shares} shares")
             return shares
         
-        return self.config.shares_per_leg
+        return shares
     
     async def execute_trade(self, action: str, shares: int, prices: Dict[str, float]) -> bool:
         """Execute a trade with proper error handling."""
@@ -928,6 +1073,9 @@ class LiveTrader:
             
             self.daily_trades += 1
             
+            # Mark that a trade occurred (for PnL notification control)
+            self.trade_occurred = True
+            
             # Send Telegram notification for trade execution
             try:
                 # Calculate trade details for notification
@@ -969,6 +1117,7 @@ class LiveTrader:
                     cumulative_pnl=self.portfolio_value - self.config.initial_capital,
                     trade_id=f"{action}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 )
+                self.logger.info(f"Sent trade notification for {trade_type} action")
             except Exception as e:
                 self.logger.warning(f"Failed to send Telegram trade notification: {e}")
             
@@ -1016,20 +1165,35 @@ class LiveTrader:
     async def collect_price_data(self, prices: Dict[str, float]):
         """Collect price data for the current trading day."""
         try:
-            # Reset data if it's a new trading day
-            self.reset_daily_data()
-            
             # Add current prices to data
             for symbol, price in prices.items():
+                # Ensure timezone-naive datetime for consistency
+                current_time = dt.datetime.now()
+                if current_time.tzinfo is not None:
+                    current_time = current_time.replace(tzinfo=None)
+                
                 self.price_data[symbol].append({
-                    'datetime': dt.datetime.now(),
+                    'datetime': current_time,
                     'close': price
                 })
             
-            self.data_points_today += 1
+            # Update data points count to reflect total data points
+            self.data_points_today = len(self.price_data[self.config.sym1])
             
-            # Log data collection progress
-            if self.data_points_today % 10 == 0:  # Log every 10 data points
+            # Debug: Check if prices are changing
+            if len(self.price_data[self.config.sym1]) > 1:
+                last_spy = self.price_data[self.config.sym1][-2]['close']
+                current_spy = self.price_data[self.config.sym1][-1]['close']
+                last_voo = self.price_data[self.config.sym2][-2]['close']
+                current_voo = self.price_data[self.config.sym2][-1]['close']
+                
+                if last_spy == current_spy and last_voo == current_voo:
+                    self.logger.warning(f"⚠️  PRICES UNCHANGED: SPY ${current_spy:.2f}, VOO ${current_voo:.2f}")
+                else:
+                    self.logger.info(f"📈 Price change: SPY ${last_spy:.2f}→${current_spy:.2f}, VOO ${last_voo:.2f}→${current_voo:.2f}")
+            
+            # Log data collection progress (reduced frequency)
+            if self.data_points_today % 30 == 0:  # Log every 30 data points
                 sym1_count = len(self.price_data[self.config.sym1])
                 sym2_count = len(self.price_data[self.config.sym2])
                 self.logger.info(f"Data collection: {sym1_count} {self.config.sym1}, {sym2_count} {self.config.sym2} points")
@@ -1037,27 +1201,74 @@ class LiveTrader:
         except Exception as e:
             self.logger.error(f"Error collecting price data: {e}")
     
-    async def generate_signal(self, prices: Dict[str, float]) -> Optional[str]:
-        """Generate trading signal based on current market data."""
+    async def calculate_spread_statistics(self, prices: Dict[str, float]) -> Dict[str, any]:
+        """Calculate spread statistics and return them for notifications."""
         try:
             # Check if we have sufficient data for the current trading day
             if not self.has_sufficient_data():
-                return None
+                return {
+                    'has_sufficient_data': False,
+                    'current_spread': None,
+                    'rolling_mean': None,
+                    'rolling_std': None,
+                    'current_zscore': None
+                }
             
             # Validate that all data is from the same trading day
             if not self.validate_same_day_data():
-                self.logger.error("Data validation failed - cannot generate signal")
-                return None
+                self.logger.error("Data validation failed - cannot calculate spread")
+                return {
+                    'has_sufficient_data': False,
+                    'current_spread': None,
+                    'rolling_mean': None,
+                    'rolling_std': None,
+                    'current_zscore': None
+                }
             
             # Create DataFrame for strategy using only today's data
             df1 = pd.DataFrame(self.price_data[self.config.sym1])
             df2 = pd.DataFrame(self.price_data[self.config.sym2])
             
-            # Merge data
-            df = pd.merge(df1, df2, on='datetime', suffixes=(f'_{self.config.sym1}', f'_{self.config.sym2}'))
+            # Debug: Check data before merge
+            self.logger.debug(f"Before merge: {len(df1)} {self.config.sym1} points, {len(df2)} {self.config.sym2} points")
+            if len(df1) > 0 and len(df2) > 0:
+                self.logger.debug(f"Latest {self.config.sym1}: {df1.iloc[-1]['close']:.2f} at {df1.iloc[-1]['datetime']}")
+                self.logger.debug(f"Latest {self.config.sym2}: {df2.iloc[-1]['close']:.2f} at {df2.iloc[-1]['datetime']}")
+            
+            # Normalize timezone for datetime comparison
+            # Convert all datetime objects to timezone-naive for consistent comparison
+            for col in ['datetime']:
+                if col in df1.columns:
+                    # Handle timezone conversion more robustly
+                    df1[col] = pd.to_datetime(df1[col]).apply(
+                        lambda x: x.replace(tzinfo=None) if x.tzinfo is not None else x
+                    )
+                if col in df2.columns:
+                    # Handle timezone conversion more robustly
+                    df2[col] = pd.to_datetime(df2[col]).apply(
+                        lambda x: x.replace(tzinfo=None) if x.tzinfo is not None else x
+                    )
+            
+            # Use outer merge to include all data points, then forward fill missing values
+            df = pd.merge(df1, df2, on='datetime', how='outer', suffixes=(f'_{self.config.sym1}', f'_{self.config.sym2}'))
+            
+            # Sort by datetime and forward fill missing values
+            df = df.sort_values('datetime').ffill()
+            
+            # Remove any rows that still have NaN values (from the beginning)
+            df = df.dropna()
+            
+            self.logger.debug(f"After merge: {len(df)} combined points")
             
             if len(df) < self.config.window:
-                return None
+                self.logger.warning(f"Insufficient merged data: {len(df)} < {self.config.window}")
+                return {
+                    'has_sufficient_data': False,
+                    'current_spread': None,
+                    'rolling_mean': None,
+                    'rolling_std': None,
+                    'current_zscore': None
+                }
             
             # Calculate spread and z-score
             df['spread'] = df[f'close_{self.config.sym1}'] - df[f'close_{self.config.sym2}']
@@ -1065,34 +1276,67 @@ class LiveTrader:
             df['rolling_std'] = df['spread'].rolling(window=self.config.window).std()
             df['zscore'] = (df['spread'] - df['rolling_mean']) / df['rolling_std']
             
-            # Get latest z-score
+            # Get latest values
+            current_spread = df['spread'].iloc[-1]
+            current_rolling_mean = df['rolling_mean'].iloc[-1]
+            current_rolling_std = df['rolling_std'].iloc[-1]
             current_zscore = df['zscore'].iloc[-1]
             
-            # Generate signal
-            if pd.isna(current_zscore):
+            # Debug: Log the actual calculation
+            self.logger.debug(f"Spread calculation: {df[f'close_{self.config.sym1}'].iloc[-1]:.2f} - {df[f'close_{self.config.sym2}'].iloc[-1]:.2f} = {current_spread:.4f}")
+            self.logger.debug(f"Rolling stats: mean={current_rolling_mean:.4f}, std={current_rolling_std:.4f}, z-score={current_zscore:.4f}")
+            
+            return {
+                'has_sufficient_data': True,
+                'current_spread': current_spread,
+                'rolling_mean': current_rolling_mean,
+                'rolling_std': current_rolling_std,
+                'current_zscore': current_zscore
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating spread statistics: {e}")
+            return {
+                'has_sufficient_data': False,
+                'current_spread': None,
+                'rolling_mean': None,
+                'rolling_std': None,
+                'current_zscore': None
+            }
+    
+    async def generate_signal(self, prices: Dict[str, float]) -> Optional[str]:
+        """Generate trading signal using the strategy's real-time data processing."""
+        try:
+            # Use the strategy's real-time signal generation
+            df = await self.strategy.get_latest_signals()
+            
+            if df.empty:
+                self.logger.debug("No data available for signal generation")
                 return None
             
-            signal = None
+            # Get the latest signal from the strategy
+            latest_row = df.iloc[-1]
             
-            if self.current_position == 0:  # No position
-                if current_zscore < -self.config.entry_threshold:
-                    signal = "BUY_LONG"
-                elif current_zscore > self.config.entry_threshold:
-                    signal = "SELL_SHORT"
-            else:  # Have position
-                if abs(current_zscore) < self.config.exit_threshold:
-                    signal = "CLOSE"
+            # Extract signal information
+            signal = latest_row.get('signal', None)
+            current_zscore = latest_row.get('zscore', 0.0)
+            current_spread = latest_row.get('spread', 0.0)
             
-            if signal:
-                self.logger.info(f"Signal: {signal} (z-score: {current_zscore:.2f})")
+            if signal and signal != 'HOLD':
+                self.logger.info(f"🎯 STRATEGY SIGNAL: {signal} (z-score: {current_zscore:.4f}, spread: {current_spread:.4f})")
+                
+                # Record signal in history
                 self.signal_history.append({
                     'datetime': dt.datetime.now(),
                     'signal': signal,
                     'zscore': current_zscore,
-                    'spread': df['spread'].iloc[-1]
+                    'spread': current_spread
                 })
-            
-            return signal
+                
+                return signal
+            else:
+                self.logger.debug(f"Strategy signal: {signal} (z-score: {current_zscore:.4f})")
+                return None
             
         except Exception as e:
             self.logger.error(f"Error generating signal: {e}")
@@ -1104,12 +1348,8 @@ class LiveTrader:
         current_time = time.time()
         if hasattr(self, 'last_portfolio_update'):
             time_since_last_update = current_time - self.last_portfolio_update
-            self.logger.debug(f"Time since last portfolio update: {time_since_last_update:.1f}s")
             if time_since_last_update < 30.0:  # 30-second minimum interval
-                self.logger.debug(f"Rate limiting portfolio update - last update was {time_since_last_update:.1f}s ago")
                 return
-        
-        self.logger.debug(f"Making portfolio update request at {current_time}")
         
         try:
             # Get real-time account information
@@ -1122,34 +1362,37 @@ class LiveTrader:
                 if self.portfolio_value > self.peak_portfolio:
                     self.peak_portfolio = self.portfolio_value
                 
-                self.logger.debug(f"Portfolio updated: ${self.portfolio_value:.2f}")
                 self.last_portfolio_update = current_time
                 
-                # Send PnL notification (rate limited by the function itself)
-                try:
-                    # Calculate PnL metrics
-                    daily_pnl = self.portfolio_value - self.daily_start_value
-                    cumulative_pnl = self.portfolio_value - self.config.initial_capital
-                    daily_pnl_pct = 0
-                    if self.daily_start_value > 0:
-                        daily_pnl_pct = daily_pnl / self.daily_start_value * 100
-                    
-                    drawdown = max(0, self.peak_portfolio - self.portfolio_value)
-                    drawdown_pct = 0
-                    if self.peak_portfolio > 0:
-                        drawdown_pct = drawdown / self.peak_portfolio * 100
-                    
-                    await send_pnl_update(
-                        portfolio_value=self.portfolio_value,
-                        daily_pnl=daily_pnl,
-                        cumulative_pnl=cumulative_pnl,
-                        daily_pnl_pct=daily_pnl_pct,
-                        peak_portfolio=self.peak_portfolio,
-                        drawdown=drawdown,
-                        drawdown_pct=drawdown_pct
-                    )
-                except Exception as e:
-                    self.logger.warning(f"Failed to send Telegram PnL notification: {e}")
+                # Send PnL notification only when trades occur
+                if hasattr(self, 'trade_occurred') and self.trade_occurred:
+                    try:
+                        # Calculate PnL metrics
+                        daily_pnl = self.portfolio_value - self.daily_start_value
+                        cumulative_pnl = self.portfolio_value - self.config.initial_capital
+                        daily_pnl_pct = 0
+                        if self.daily_start_value > 0:
+                            daily_pnl_pct = daily_pnl / self.daily_start_value * 100
+                        
+                        drawdown = max(0, self.peak_portfolio - self.portfolio_value)
+                        drawdown_pct = 0
+                        if self.peak_portfolio > 0:
+                            drawdown_pct = drawdown / self.peak_portfolio * 100
+                        
+                        await send_pnl_update(
+                            portfolio_value=self.portfolio_value,
+                            daily_pnl=daily_pnl,
+                            cumulative_pnl=cumulative_pnl,
+                            daily_pnl_pct=daily_pnl_pct,
+                            peak_portfolio=self.peak_portfolio,
+                            drawdown=drawdown,
+                            drawdown_pct=drawdown_pct
+                        )
+                        self.logger.info("Sent PnL notification after trade")
+                        # Reset the trade flag
+                        self.trade_occurred = False
+                    except Exception as e:
+                        self.logger.warning(f"Failed to send Telegram PnL notification: {e}")
             else:
                 # CRITICAL ERROR: Cannot continue without portfolio value
                 self.logger.error("CRITICAL: Could not get portfolio value from API during trading")
@@ -1165,6 +1408,16 @@ class LiveTrader:
         """Main trading loop."""
         self.logger.info("Starting live trading loop")
         
+        # Set initial state to TRADING if market is open
+        if self.is_market_open():
+            self.logger.info("Market is open - starting trading")
+            self.state = TradingState.TRADING
+            self.daily_start_value = self.portfolio_value
+            self.daily_trades = 0
+        else:
+            self.logger.info("Market is closed - waiting for market open")
+            self.state = TradingState.WAITING_FOR_MARKET_OPEN
+        
         while self.state != TradingState.STOPPED:
             try:
                 # Check connection health
@@ -1176,7 +1429,9 @@ class LiveTrader:
                         break
                 
                 # Check if market is open
-                if not self.is_market_open():
+                market_open = self.is_market_open()
+                
+                if not market_open:
                     if self.state == TradingState.TRADING:
                         self.logger.info("Market closed - stopping trading")
                         self.state = TradingState.MARKET_CLOSED
@@ -1188,10 +1443,6 @@ class LiveTrader:
                     self.state = TradingState.TRADING
                     self.daily_start_value = self.portfolio_value
                     self.daily_trades = 0
-                    
-                    # Initialize daily data collection
-                    await asyncio.sleep(2)  # Brief delay to ensure session stability
-                    await self.initialize_daily_data()
                 
                 # Check risk limits
                 if not self.check_risk_limits():
@@ -1199,33 +1450,23 @@ class LiveTrader:
                     self.state = TradingState.STOPPED
                     break
                 
-                # Always get current prices and collect data
+                # Get current prices for position sizing and execution
                 prices = await self.get_current_prices()
                 if not prices:
                     self.logger.warning("No price data - skipping iteration")
                     await asyncio.sleep(10)
                     continue
                 
-                # Always collect data first
-                await self.collect_price_data(prices)
+                # Generate signal using strategy's real-time data processing
+                signal = await self.generate_signal(prices)
                 
-                # Check if we have sufficient data for trading
-                if self.has_sufficient_data():
-                    # Generate signal only if we have enough data
-                    signal = await self.generate_signal(prices)
-                    
-                    # Execute trade if signal
-                    if signal:
-                        shares = self.calculate_position_size(prices)
-                        if shares > 0:
-                            success = await self.execute_trade(signal, shares, prices)
-                            if not success:
-                                self.logger.error("Trade execution failed")
-                else:
-                    # Still log status even when collecting data
-                    self.logger.info(f"Collecting data for trading day {self.current_trading_day} - "
-                                   f"Portfolio: ${self.portfolio_value:.2f} | "
-                                   f"Position: {self.current_position}")
+                # Execute trade if signal
+                if signal:
+                    shares = self.calculate_position_size(prices)
+                    if shares > 0:
+                        success = await self.execute_trade(signal, shares, prices)
+                        if not success:
+                            self.logger.error("Trade execution failed")
                 
                 # Update portfolio value
                 await self.update_portfolio_value()
@@ -1233,11 +1474,10 @@ class LiveTrader:
                 # Log status
                 self.logger.info(f"Portfolio: ${self.portfolio_value:.2f} | "
                                f"Position: {self.current_position} | "
-                               f"Trades: {self.daily_trades} | "
-                               f"Data points: {self.data_points_today}")
+                               f"Trades: {self.daily_trades}")
                 
-                # Wait before next iteration - changed to 10 seconds for testing
-                await asyncio.sleep(10)  # Check every 10 seconds
+                # Wait before next iteration - 10 seconds for 5-second bar strategy
+                await asyncio.sleep(10)
                 
             except Exception as e:
                 self.logger.error(f"Error in trading loop: {e}")
@@ -1290,17 +1530,10 @@ class LiveTrader:
                 return
             
             # Initialize strategy
-            self.strategy = ZScoreStatArbStrategy(
+            self.strategy = ETFArbitrageStrategy(
                 self.ib,
-                sym1=self.config.sym1,
-                sym2=self.config.sym2,
-                window=self.config.window,
-                entry_threshold=self.config.entry_threshold,
-                exit_threshold=self.config.exit_threshold,
-                shares_per_leg=self.config.shares_per_leg,
-                initial_capital=self.config.initial_capital,
-                slippage=self.config.slippage,
-                fee=self.config.fee
+                strategy_name='etf_arbitrage',
+                data_mode='live'  # Use live mode for real-time data
             )
             
             self.logger.info(f"{mode} trading system initialized")
@@ -1355,6 +1588,8 @@ class LiveTrader:
 
 
 if __name__ == "__main__":
+    import sys
+    
     print("TRADING SYSTEM")
     print("="*60)
     print("PAPER TRADING: Port 4002")
@@ -1367,10 +1602,18 @@ if __name__ == "__main__":
     print("   - Live trading: Port 4001")
     print("="*60)
     
-    # Ask for trading mode
-    print("Starting interactive mode...")
-    mode = input("Select mode (paper/live): ").lower().strip()
-    print(f"Selected mode: {mode}")
+    # Check if running in non-interactive mode (called from web interface)
+    if len(sys.argv) > 1 and sys.argv[1] == "--paper":
+        mode = "paper"
+        print("Starting PAPER trading (non-interactive mode)")
+    elif len(sys.argv) > 1 and sys.argv[1] == "--live":
+        mode = "live"
+        print("Starting LIVE trading (non-interactive mode)")
+    else:
+        # Interactive mode
+        print("Starting interactive mode...")
+        mode = input("Select mode (paper/live): ").lower().strip()
+        print(f"Selected mode: {mode}")
     
     if mode == "live":
         print("LIVE TRADING - REAL MONEY!")
