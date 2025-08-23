@@ -11,8 +11,8 @@ import matplotlib.pyplot as plt
 
 from strategy_layer.base import BaseStrategy
 from data_layer.data_feed import (
-    fetch_pair_data, fetch_historical_bars_simple, fetch_real_time_bars_simple,
-    filter_trading_hours, detect_trading_hours_automatically,
+    fetch_pair_data, fetch_historical_bars, start_real_time_bars, cancel_real_time_bars,
+    fetch_market_data, filter_trading_hours, detect_trading_hours_automatically,
     create_stock_contract, qualify_contract
 )
 from data_layer.processors import (
@@ -31,11 +31,25 @@ class ETFArbitrageStrategy(BaseStrategy):
         super().__init__(ib, strategy_name, data_mode)
         self.sym1, self.sym2 = self.strategy_config['symbols']
         
+        # Create contracts for both symbols
+        self.contract1 = create_stock_contract(self.sym1)
+        self.contract2 = create_stock_contract(self.sym2)
+        
         # For live mode: store historical data for rolling calculations
         self.historical_data = pd.DataFrame()
         self.last_update_time = None
+        
+        # For live mode: real-time bars containers
+        self.real_time_bars1 = None
+        self.real_time_bars2 = None
+        self.last_bar1 = {}
+        self.last_bar2 = {}
+        
+        # For live mode: track latest processed data
+        self.latest_processed_data = None
+        self.last_signal_time = None
     
-    async def fetch_data(self, duration: str, end_datetime: Optional[str] = None) -> pd.DataFrame:
+    async def fetch_data(self, duration: str, end_datetime: Optional[dt.datetime] = None) -> pd.DataFrame:
         """
         Fetch historical data for backtesting.
         """
@@ -45,12 +59,11 @@ class ETFArbitrageStrategy(BaseStrategy):
         if end_datetime is None:
             end_datetime = dt.datetime.now()
         
-        # Fetch historical data for backtesting
+        # Fetch historical data for backtesting using the new data_feed functions
         df = await fetch_pair_data(
             self.ib, 
-            self.sym1, 
-            self.sym2, 
-            contract_type="stock",
+            self.contract1, 
+            self.contract2, 
             duration=duration,
             end_datetime=end_datetime
         )
@@ -72,6 +85,63 @@ class ETFArbitrageStrategy(BaseStrategy):
         
         return df
     
+    async def start_live_data_stream(self):
+        """
+        Start real-time data streams for live trading.
+        """
+        if self.data_mode != 'live':
+            raise ValueError("start_live_data_stream() is for live mode only.")
+        
+        try:
+            # Use config bar_size for consistency
+            bar_size = int(config.DATA_CONFIG['bar_size'].split()[0])  # Extract number from "10 secs"
+            
+            # Start real-time bars for both symbols
+            self.real_time_bars1 = start_real_time_bars(
+                self.ib,
+                self.contract1,
+                self.last_bar1,
+                bar_size=bar_size,  # Use config bar_size
+                what_to_show="TRADES",
+                use_rth=True
+            )
+            
+            self.real_time_bars2 = start_real_time_bars(
+                self.ib,
+                self.contract2,
+                self.last_bar2,
+                bar_size=bar_size,  # Use config bar_size
+                what_to_show="TRADES",
+                use_rth=True
+            )
+            
+            print(f"Started real-time data streams for {self.sym1} and {self.sym2} with {bar_size}-second bars")
+            
+        except Exception as e:
+            print(f"Error starting live data streams: {e}")
+            raise
+    
+    def stop_live_data_stream(self):
+        """
+        Stop real-time data streams.
+        """
+        if self.data_mode != 'live':
+            return
+        
+        try:
+            if self.real_time_bars1:
+                cancel_real_time_bars(self.ib, self.real_time_bars1, self.contract1)
+                self.real_time_bars1 = None
+            
+            if self.real_time_bars2:
+                cancel_real_time_bars(self.ib, self.real_time_bars2, self.contract2)
+                self.real_time_bars2 = None
+                
+            print("Stopped real-time data streams")
+            
+        except Exception as e:
+            print(f"Error stopping live data streams: {e}")
+    
     async def fetch_latest_data(self) -> pd.DataFrame:
         """
         Fetch latest real-time data for live trading.
@@ -80,44 +150,47 @@ class ETFArbitrageStrategy(BaseStrategy):
             raise ValueError("fetch_latest_data() is for live mode only. Use fetch_data() for backtesting.")
         
         try:
-            # Get real-time bars for both symbols
-            df1 = await fetch_real_time_bars_simple(
-                self.ib, 
-                self.sym1, 
-                "stock",
-                bar_size=5,  # 5-second bars as per strategy requirement
-                what_to_show="TRADES",
-                use_rth=True,
-                timeout=5.0
-            )
+            # Check if we have recent data from real-time bars
+            current_time = dt.datetime.now()
             
-            df2 = await fetch_real_time_bars_simple(
-                self.ib, 
-                self.sym2, 
-                "stock",
-                bar_size=5,
-                what_to_show="TRADES", 
-                use_rth=True,
-                timeout=5.0
-            )
-            
-            if df1.empty or df2.empty:
-                return pd.DataFrame()
-            
-            # Merge the data
-            df = pd.merge(
-                df1[['datetime', 'close']],
-                df2[['datetime', 'close']],
-                on='datetime',
-                how='inner',
-                suffixes=(f'_{self.sym1}', f'_{self.sym2}')
-            )
+            # If we don't have real-time bars set up, try to get market data
+            if not self.real_time_bars1 or not self.real_time_bars2:
+                # Fallback to market data if real-time bars not available
+                data1 = await fetch_market_data(self.ib, self.contract1)
+                data2 = await fetch_market_data(self.ib, self.contract2)
+                
+                if not data1 or not data2:
+                    return pd.DataFrame()
+                
+                # Create a single row DataFrame with current market data
+                df = pd.DataFrame([{
+                    'datetime': current_time,
+                    f'close_{self.sym1}': data1.get('last', data1.get('market_price', 0)),
+                    f'close_{self.sym2}': data2.get('last', data2.get('market_price', 0))
+                }])
+            else:
+                # Use real-time bars data
+                if not self.last_bar1 or not self.last_bar2:
+                    return pd.DataFrame()
+                
+                # Check if data is recent (within last 15 seconds to account for bar size)
+                time_diff1 = (current_time - self.last_bar1.get('timestamp', dt.datetime.min)).total_seconds()
+                time_diff2 = (current_time - self.last_bar2.get('timestamp', dt.datetime.min)).total_seconds()
+                
+                if time_diff1 > 15 or time_diff2 > 15:
+                    print("Warning: Real-time data may be stale")
+                
+                df = pd.DataFrame([{
+                    'datetime': current_time,
+                    f'close_{self.sym1}': self.last_bar1.get('close', 0),
+                    f'close_{self.sym2}': self.last_bar2.get('close', 0)
+                }])
             
             # Add to historical data for rolling calculations
             self.historical_data = pd.concat([self.historical_data, df], ignore_index=True)
             
-            # Keep only recent data for rolling window calculations
-            window_size = self.strategy_config['window'] * 2  # Keep extra data for safety
+            # Keep only recent data for rolling window calculations (window + buffer)
+            window_size = self.strategy_config['window'] + 50  # Keep extra data for safety
             if len(self.historical_data) > window_size:
                 self.historical_data = self.historical_data.tail(window_size).copy()
             
@@ -127,6 +200,48 @@ class ETFArbitrageStrategy(BaseStrategy):
             print(f"Error fetching latest data: {e}")
             return pd.DataFrame()
     
+    async def fetch_historical_data_for_live(self, duration: str = "5 D") -> pd.DataFrame:
+        """
+        Fetch historical data for live trading initialization.
+        """
+        if self.data_mode != 'live':
+            raise ValueError("fetch_historical_data_for_live() is for live mode only.")
+        
+        try:
+            # Fetch historical data to initialize rolling calculations
+            df = await fetch_pair_data(
+                self.ib,
+                self.contract1,
+                self.contract2,
+                duration=duration,
+                end_datetime=dt.datetime.now()
+            )
+            
+            # Filter trading hours if enabled
+            if self.strategy_config['filter_trading_hours']:
+                if self.strategy_config['auto_detect_hours']:
+                    # First compute spread to enable automatic detection
+                    df = self.process_data(df)
+                    trading_mask = detect_trading_hours_automatically(
+                        df, 
+                        self.strategy_config['volatility_threshold']
+                    )
+                    df = df[trading_mask].copy()
+                    # Recompute spread and zscore with filtered data
+                    df = self.process_data(df)
+                else:
+                    df = filter_trading_hours(df)
+            
+            # Store as historical data for live trading
+            self.historical_data = df.copy()
+            print(f"Initialized historical data with {len(df)} bars for live trading")
+            
+            return df
+            
+        except Exception as e:
+            print(f"Error fetching historical data for live trading: {e}")
+            return pd.DataFrame()
+    
     def process_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Process raw data into strategy signals.
@@ -134,33 +249,39 @@ class ETFArbitrageStrategy(BaseStrategy):
         if df.empty:
             return df
         
-        # For live mode, use historical data for rolling calculations
-        if self.data_mode == 'live' and not self.historical_data.empty:
-            # Use historical data for rolling stats, but current data for spread
-            historical_df = self.historical_data.copy()
-            
+        # For live mode with single-row data, use historical data for rolling calculations
+        if self.data_mode == 'live' and len(df) == 1 and not self.historical_data.empty:
             # Compute spread on current data
             df = compute_spread(df, self.sym1, self.sym2)
             
-            # Compute rolling statistics on historical data
+            # Use historical data for rolling statistics
+            historical_df = self.historical_data.copy()
             historical_df = compute_spread(historical_df, self.sym1, self.sym2)
             historical_df = compute_rolling_stats(historical_df, self.strategy_config['window'])
             
-            # Get the latest rolling stats
-            latest_stats = historical_df.tail(1)
-            
-            # Apply latest stats to current data
-            for col in ['rolling_mean', 'rolling_std', 'upper', 'lower']:
-                if col in latest_stats.columns:
-                    df[col] = latest_stats[col].iloc[0]
-            
-            # Compute z-score for current data
-            if 'rolling_std' in df.columns and df['rolling_std'].iloc[0] > 0:
-                df['zscore'] = (df['spread'] - df['rolling_mean']) / df['rolling_std']
+            # Get the latest rolling stats from historical data
+            if len(historical_df) > 0:
+                latest_stats = historical_df.iloc[-1]  # Get last row, not tail(1)
+                
+                # Apply latest stats to current data
+                for col in ['rolling_mean', 'rolling_std', 'upper', 'lower']:
+                    if col in latest_stats.index:
+                        df[col] = latest_stats[col]
+                
+                # Compute z-score for current data
+                if 'rolling_std' in df.columns and df['rolling_std'].iloc[0] > 0:
+                    df['zscore'] = (df['spread'] - df['rolling_mean']) / df['rolling_std']
+                else:
+                    df['zscore'] = 0.0
             else:
+                # No historical data available, set default values
+                df['rolling_mean'] = 0.0
+                df['rolling_std'] = 1.0
+                df['upper'] = 1.0
+                df['lower'] = -1.0
                 df['zscore'] = 0.0
         else:
-            # For backtest mode or when no historical data available
+            # For backtest mode or multi-row data
             # Compute spread
             df = compute_spread(df, self.sym1, self.sym2)
             
@@ -196,6 +317,40 @@ class ETFArbitrageStrategy(BaseStrategy):
         Compute PnL and performance metrics.
         """
         return compute_pnl(df)
+    
+    async def get_latest_signals(self) -> pd.DataFrame:
+        """
+        Get the latest signals for live trading with proper timing control.
+        """
+        if self.data_mode != 'live':
+            raise ValueError("get_latest_signals() is for live mode only.")
+        
+        current_time = dt.datetime.now()
+        
+        # Check if enough time has passed since last signal (respect bar size)
+        bar_size_seconds = int(config.DATA_CONFIG['bar_size'].split()[0])
+        if (self.last_signal_time and 
+            (current_time - self.last_signal_time).total_seconds() < bar_size_seconds):
+            # Return cached result if not enough time has passed
+            return self.latest_processed_data if self.latest_processed_data is not None else pd.DataFrame()
+        
+        # Fetch latest data
+        df = await self.fetch_latest_data()
+        
+        if df.empty:
+            return pd.DataFrame()
+        
+        # Process data
+        df = self.process_data(df)
+        
+        # Generate signals
+        df = self.generate_signals(df)
+        
+        # Cache the result and update timing
+        self.latest_processed_data = df
+        self.last_signal_time = current_time
+        
+        return df
     
     def run_cointegration_tests(self, df: pd.DataFrame) -> Dict[str, Any]:
         """

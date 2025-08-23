@@ -115,22 +115,32 @@ class TestDataProcessing:
 class TestRealTimeBars:
     """Test real-time bars functionality - requires IB connection."""
     
+    def setup_method(self):
+        """Called before each test method."""
+        self.ib = None
+    
+    def teardown_method(self):
+        """Called after each test method - guaranteed cleanup."""
+        if self.ib is not None:
+            self.ib.disconnect()
+            print("Disconnected from IB")
+    
     @pytest.mark.asyncio
     async def test_real_time_bars(self):
         """Test real-time bars: start, wait 6 seconds, check last_bar, stop."""
         print("\n=== TESTING REAL-TIME BARS ===")
         
         # Connect to IB
-        ib = IB()
-        await ib.connectAsync('127.0.0.1', 4002, clientId=999)
+        self.ib = IB()
+        await self.ib.connectAsync('127.0.0.1', 4002, clientId=888)
         print("Connected to IB")
         
         # Test with BTC (crypto markets are 24/7)
         last_bar = {}
         
         # Create BTC contract and qualify it
-        btc_contract = create_crypto_contract("BTC", "PAXOS", "USD")
-        qualified_contract = await qualify_contract(ib, btc_contract)
+        btc_contract = create_crypto_contract("BTC", "ZEROHASH", "USD")
+        qualified_contract = await qualify_contract(self.ib, btc_contract)
         
         if not qualified_contract:
             raise Exception("Could not qualify BTC contract")
@@ -139,7 +149,7 @@ class TestRealTimeBars:
         
         # Start subscription
         bars_container = start_real_time_bars(
-            ib, qualified_contract, last_bar, use_rth=False
+            self.ib, qualified_contract, last_bar, use_rth=False
         )
         
         if bars_container is None:
@@ -167,13 +177,10 @@ class TestRealTimeBars:
         
         print(f"✓ Successfully received real-time bar: ${last_bar['close']}")
         
-        # Cleanup
+        # Cleanup subscription
         if bars_container is not None:
-            cancel_real_time_bars(ib, bars_container)
+            cancel_real_time_bars(self.ib, bars_container)
             print("Cancelled subscription")
-        
-        ib.disconnect()
-        print("Disconnected from IB")
 
 
 if __name__ == '__main__':
