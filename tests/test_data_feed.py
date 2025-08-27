@@ -84,7 +84,7 @@ class TestDataProcessing:
         """Test trading hours filtering."""
         # Create test data
         df = pd.DataFrame({
-            'datetime': pd.date_range('2024-01-01 09:00:00', periods=24, freq='1H'),
+            'datetime': pd.date_range('2024-01-01 09:00:00', periods=24, freq='1h'),
             'close': [100] * 24
         })
         
@@ -146,14 +146,18 @@ class TestRealTimeBars:
             raise Exception("Could not qualify BTC contract")
         
         print("Qualified BTC contract successfully")
+        print('qualified contract: ', qualified_contract)
         
         # Start subscription
         bars_container = start_real_time_bars(
             self.ib, qualified_contract, last_bar, use_rth=False
         )
         
+        
         if bars_container is None:
             raise Exception("Could not start real-time bars subscription")
+
+        print('bars container: ',bars_container)
         
         print("Started real-time bars subscription")
         print("Waiting 6 seconds...")

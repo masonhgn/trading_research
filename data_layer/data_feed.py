@@ -88,7 +88,7 @@ def create_option_contract(
 
 def create_crypto_contract(
     symbol: str,
-    exchange: str = "PAXOS",
+    exchange: str = "ZEROHASH",
     currency: str = "USD"
 ) -> Crypto:
     """Create a crypto contract."""

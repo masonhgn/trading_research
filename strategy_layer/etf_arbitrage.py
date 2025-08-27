@@ -9,17 +9,38 @@ from statsmodels.tsa.stattools import coint, adfuller
 from typing import Dict, Any, Optional
 import matplotlib.pyplot as plt
 
-from strategy_layer.base import BaseStrategy
-from data_layer.data_feed import (
-    fetch_pair_data, fetch_historical_bars, start_real_time_bars, cancel_real_time_bars,
-    fetch_market_data, filter_trading_hours, detect_trading_hours_automatically,
-    create_stock_contract, qualify_contract
-)
-from data_layer.processors import (
-    compute_spread, compute_rolling_stats, compute_dynamic_zscore,
-    generate_signals, compute_pnl
-)
-from infrastructure.config import config
+import sys
+import os
+
+# Add the project root to the Python path for direct execution
+if __name__ == "__main__":
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:
+    from strategy_layer.base import BaseStrategy
+    from data_layer.data_feed import (
+        fetch_pair_data, fetch_historical_bars, start_real_time_bars, cancel_real_time_bars,
+        fetch_market_data, filter_trading_hours, detect_trading_hours_automatically,
+        create_stock_contract, qualify_contract
+    )
+    from data_layer.processors import (
+        compute_spread, compute_rolling_stats, compute_dynamic_zscore,
+        generate_signals, compute_pnl
+    )
+    from infrastructure.config import config
+except ImportError:
+    # Fallback for direct execution
+    from base import BaseStrategy
+    from data_feed import (
+        fetch_pair_data, fetch_historical_bars, start_real_time_bars, cancel_real_time_bars,
+        fetch_market_data, filter_trading_hours, detect_trading_hours_automatically,
+        create_stock_contract, qualify_contract
+    )
+    from processors import (
+        compute_spread, compute_rolling_stats, compute_dynamic_zscore,
+        generate_signals, compute_pnl
+    )
+    from config import config
 
 
 class ETFArbitrageStrategy(BaseStrategy):

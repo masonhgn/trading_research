@@ -3,8 +3,8 @@
 
 # Data Layer Configuration
 data:
-  bar_size: "10 secs"  # Options: '1 secs', '5 secs', '10 secs', '30 secs', '1 min', '5 mins', '15 mins', '30 mins', '1 hour', '1 day'
-  signal_frequency: "10 secs"  # How often to generate signals (should match bar_size for most cases)
+  bar_size: "1 min"  # Options: '1 secs', '5 secs', '10 secs', '30 secs', '1 min', '5 mins', '15 mins', '30 mins', '1 hour', '1 day'
+  signal_frequency: "1 min"  # How often to generate signals (should match bar_size for most cases)
   trading_hours:
     start: "09:30"  # Market open
     end: "16:00"    # Market close
@@ -57,7 +57,7 @@ execution:
     max_position_size_pct: 1.0  # 100% of portfolio
     max_daily_loss_pct: 0.05    # 5% daily loss limit
     max_drawdown_pct: 0.10      # 10% max drawdown
-    max_trades_per_day: 100
+    max_trades_per_day: 500
     emergency_stop_loss_pct: 0.05  # 5% emergency stop
   backtest:
     default_duration: "1 D"

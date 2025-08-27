@@ -34,8 +34,10 @@ class BacktestAnalyzer:
         """
         df = df.copy()
         
-        # Calculate portfolio value over time
-        df['portfolio_value'] = initial_capital + df['cumulative_pnl']
+        # Use existing portfolio_value if available (from dynamic position sizing)
+        # Otherwise calculate from cumulative PnL
+        if 'portfolio_value' not in df.columns:
+            df['portfolio_value'] = initial_capital + df['cumulative_pnl']
         
         # For intraday strategies, calculate returns based on PnL changes
         # This is more accurate than portfolio value changes

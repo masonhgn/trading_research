@@ -13,3 +13,4 @@ Flask-SocketIO
 Werkzeug
 eventlet
 pytest
+pytest-asyncio
