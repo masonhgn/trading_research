@@ -273,11 +273,23 @@ class ETFArbitrageStrategy(BaseStrategy):
         # For live mode with single-row data, use historical data for rolling calculations
         if self.data_mode == 'live' and len(df) == 1 and not self.historical_data.empty:
             # Compute spread on current data
-            df = compute_spread(df, self.sym1, self.sym2)
+            df = compute_spread(
+                df, 
+                self.sym1, 
+                self.sym2,
+                self.strategy_config.get('use_rolling_hedge', False),
+                self.strategy_config.get('hedge_window', 60)
+            )
             
             # Use historical data for rolling statistics
             historical_df = self.historical_data.copy()
-            historical_df = compute_spread(historical_df, self.sym1, self.sym2)
+            historical_df = compute_spread(
+                historical_df, 
+                self.sym1, 
+                self.sym2,
+                self.strategy_config.get('use_rolling_hedge', False),
+                self.strategy_config.get('hedge_window', 60)
+            )
             historical_df = compute_rolling_stats(historical_df, self.strategy_config['window'])
             
             # Get the latest rolling stats from historical data
@@ -304,7 +316,13 @@ class ETFArbitrageStrategy(BaseStrategy):
         else:
             # For backtest mode or multi-row data
             # Compute spread
-            df = compute_spread(df, self.sym1, self.sym2)
+            df = compute_spread(
+                df, 
+                self.sym1, 
+                self.sym2,
+                self.strategy_config.get('use_rolling_hedge', False),
+                self.strategy_config.get('hedge_window', 60)
+            )
             
             # Compute rolling statistics
             df = compute_rolling_stats(df, self.strategy_config['window'])
@@ -319,6 +337,14 @@ class ETFArbitrageStrategy(BaseStrategy):
             print(f"Using dynamic thresholds (distribution: {self.strategy_config['distribution_type']}, confidence: {self.strategy_config['confidence_level']})")
         else:
             print(f"Using fixed thresholds (entry: {self.strategy_config['entry_threshold']}, exit: {self.strategy_config['exit_threshold']})")
+        
+        # Log hedge ratio information
+        if 'hedge_ratio' in df.columns:
+            if self.strategy_config.get('use_rolling_hedge', False):
+                print(f"Using rolling hedge ratio (window: {self.strategy_config.get('hedge_window', 60)})")
+                print(f"Current hedge ratio: {df['hedge_ratio'].iloc[-1]:.4f}")
+            else:
+                print(f"Using static hedge ratio: {df['hedge_ratio'].iloc[0]:.4f}")
         
         return df
     
@@ -387,6 +413,12 @@ class ETFArbitrageStrategy(BaseStrategy):
             "adf_pval": adf_pval,
             "crit_vals": crit_vals
         }
+
+
+
+
+
+        
     
     def plot_spread(self, df: pd.DataFrame):
         """

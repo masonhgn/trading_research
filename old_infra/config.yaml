@@ -3,8 +3,8 @@
 
 # Data Layer Configuration
 data:
-  bar_size: "1 min"  # Options: '1 secs', '5 secs', '10 secs', '30 secs', '1 min', '5 mins', '15 mins', '30 mins', '1 hour', '1 day'
-  signal_frequency: "1 min"  # How often to generate signals (should match bar_size for most cases)
+  bar_size: "1 hour"  # Options: '1 secs', '5 secs', '10 secs', '30 secs', '1 min', '5 mins', '15 mins', '30 mins', '1 hour', '1 day'
+  signal_frequency: "1 hour"  # How often to generate signals (should match bar_size for most cases)
   trading_hours:
     start: "09:30"  # Market open
     end: "16:00"    # Market close
@@ -24,13 +24,15 @@ data:
 # Strategy Layer Configuration
 strategy:
   etf_arbitrage:
-    symbols: ["SPY", "VOO"]
-    window: 90
-    entry_threshold: 1.5
-    exit_threshold: 0.2
+    symbols: ["SPY", "RSP"]
+    window: 180
+    entry_threshold: 2
+    exit_threshold: 0.1
     use_dynamic_thresholds: false
     confidence_level: 0.95
     distribution_type: "t"  # Options: 't', 'normal', 'skewnorm'
+    use_rolling_hedge: true  # Use rolling hedge ratio instead of static
+    hedge_window: 90  # Window for rolling hedge ratio calculation
     slippage: 0.01
     fee: 0.005
     shares_per_leg: 200
@@ -60,7 +62,7 @@ execution:
     max_trades_per_day: 500
     emergency_stop_loss_pct: 0.05  # 5% emergency stop
   backtest:
-    default_duration: "1 D"
+    default_duration: "6 M"  # 6 months for proper backtesting
     default_end_datetime: null  # Will use current time if null
 
 # Analysis Layer Configuration
